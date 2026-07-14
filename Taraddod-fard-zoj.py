@@ -1,666 +1,457 @@
+#!/usr/bin/env python3
+"""
+Excel Processor App
+───────────────────
+1. Flatten multi-level column headers
+2. Handle merged cells (forward-fill)
+3. Merge columns with space separator
+4. Filter incomplete entry/exit rows
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
-import warnings
-from openpyxl.utils import get_column_letter
+from io import BytesIO
 
-warnings.filterwarnings("ignore", category=UserWarning)
-
-# ═══════════════════════════════════════════════════════════════
-# ترتیب دلخواه ستون‌ها در خروجی نهایی
-# ═══════════════════════════════════════════════════════════════
-DESIRED_COLUMN_ORDER = [
-    "غیبت روزانه",
-    "پایان شیفت",
-    "شروع شیفت",
-    "عنوان گروه کاری",
-    "روز هفته",
-    "تاریخ",
-    "نام خانوادگی",
-    "نام",
-    "وضعیت",
-    "مدت زمان",
-    "خروج",
-    "ورود",
-    "عنوان واحد سازمانی",
-]
-
-
-# ═══════════════════════════════════════════════════════════════
-# بخش ۱: پارس و تمیزکاری اکسل
-# ═══════════════════════════════════════════════════════════════
-
-def _find_header_row(df: pd.DataFrame) -> int | None:
-    for i in range(min(20, len(df))):
-        row_values = df.iloc[i].astype(str).values
-        row_text = " ".join(row_values)
-        if "غیبت روزانه" in row_text and "نام خانوادگی" in row_text:
-            return i
-    return None
-
-
-def _find_column_index(row: pd.Series, search_text: str) -> int | None:
-    for idx, val in enumerate(row):
-        if pd.notna(val) and search_text.strip() in str(val).strip():
-            return idx
-    return None
-
-
-def _build_column_map(header_row1: pd.Series, header_row2: pd.Series) -> dict:
-    col_map: dict[str, int] = {}
-    main_columns = [
-        "غیبت روزانه", "پایان شیفت", "شروع شیفت", "عنوان گروه کاری",
-        "روز هفته", "تاریخ", "نام خانوادگی", "نام", "روز",
-        "کد پرسنلی کارمند", "عنوان واحد سازمانی",
-    ]
-    for col_name in main_columns:
-        idx = _find_column_index(header_row1, col_name)
-        if idx is not None:
-            col_map[col_name] = idx
-
-    info_col_start = _find_column_index(header_row1, "اطلاعات تردد")
-    if info_col_start is not None:
-        for offset in range(8):
-            col_idx = info_col_start + offset
-            if col_idx >= len(header_row2):
-                break
-            val = header_row2.iloc[col_idx]
-            if pd.notna(val):
-                val_str = str(val).strip()
-                if val_str and val_str not in ("*", "nan", "None", ""):
-                    if val_str not in col_map:
-                        col_map[val_str] = col_idx
-
-    if not col_map:
-        raise ValueError("هیچ ستونی تشخیص داده نشد. ساختار فایل را بررسی کنید.")
-    return col_map
-
-
-def _extract_columns(df_data: pd.DataFrame, col_map: dict) -> pd.DataFrame:
-    sorted_cols = sorted(col_map.items(), key=lambda x: x[1])
-    df_clean = pd.DataFrame()
-    for col_name, col_idx in sorted_cols:
-        if col_idx < len(df_data.columns):
-            df_clean[col_name] = df_data[col_idx].values
-    return df_clean
-
-
-def _clean_values(df: pd.DataFrame) -> pd.DataFrame:
-    junk_values = {"*", "", "nan", "None", "none", "NaN"}
-    for col in df.columns:
-        df[col] = df[col].apply(
-            lambda x: (
-                np.nan
-                if pd.isna(x) or str(x).strip() in junk_values
-                else str(x).strip()
-            )
-        )
-    return df
-
-
-def _remove_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
-    name_cols = [c for c in ["نام", "نام خانوادگی"] if c in df.columns]
-    if name_cols:
-        before = len(df)
-        df = df.dropna(subset=name_cols, how="all")
-        removed = before - len(df)
-        if removed > 0:
-            print(f"[INFO] {removed} ردیف بدون نام حذف شد.")
-    return df
-
-
-def _drop_unwanted_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols_to_drop = [c for c in ["روز", "کد پرسنلی کارمند"] if c in df.columns]
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop)
-    return df
-
-
-def _forward_fill_personnel_code(df: pd.DataFrame) -> pd.DataFrame:
-    required = ["عنوان واحد سازمانی", "نام", "نام خانوادگی"]
-    if all(c in df.columns for c in required):
-        df["عنوان واحد سازمانی"] = df.groupby(
-            ["نام", "نام خانوادگی"], sort=False
-        )["عنوان واحد سازمانی"].ffill()
-        df["عنوان واحد سازمانی"] = df.groupby(
-            ["نام", "نام خانوادگی"], sort=False
-        )["عنوان واحد سازمانی"].bfill()
-    return df
-
-
-def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
-    ordered = [c for c in DESIRED_COLUMN_ORDER if c in df.columns]
-    extra = [c for c in df.columns if c not in DESIRED_COLUMN_ORDER]
-    return df[ordered + extra]
-
-
-def parse_and_clean_excel(file) -> pd.DataFrame:
-    df_raw = pd.read_excel(file, header=None)
-    if df_raw.empty or len(df_raw) < 7:
-        raise ValueError("فایل خالی است یا دارای داده‌های کافی نیست.")
-
-    header_row_idx = _find_header_row(df_raw)
-    if header_row_idx is None:
-        raise ValueError(
-            "ساختار فایل تشخیص داده نشد.\n"
-            "فایل باید شامل ستون‌های 'غیبت روزانه' و 'نام خانوادگی' باشد."
-        )
-
-    header_row1 = df_raw.iloc[header_row_idx]
-    header_row2 = df_raw.iloc[header_row_idx + 1]
-    data_start_row = header_row_idx + 2
-
-    col_index_map = _build_column_map(header_row1, header_row2)
-    df_data = df_raw.iloc[data_start_row:].reset_index(drop=True)
-    df_clean = _extract_columns(df_data, col_index_map)
-    df_clean = _clean_values(df_clean)
-    df_clean = _remove_empty_rows(df_clean)
-    df_clean = _drop_unwanted_columns(df_clean)
-    df_clean = _forward_fill_personnel_code(df_clean)
-    df_clean = _reorder_columns(df_clean)
-    df_clean = df_clean.reset_index(drop=True)
-    return df_clean
-
-
-# ═══════════════════════════════════════════════════════════════
-# بخش ۲: منطق آنالیز و جستجو
-# ═══════════════════════════════════════════════════════════════
-
-def get_unique_persons(df: pd.DataFrame) -> list[str]:
-    if "نام" not in df.columns or "نام خانوادگی" not in df.columns:
-        return []
-    persons = (
-        df[["نام خانوادگی", "نام"]]
-        .drop_duplicates()
-        .apply(lambda r: f"{r['نام خانوادگی']} - {r['نام']}", axis=1)
-        .tolist()
-    )
-    return persons
-
-
-def get_person_dates(df: pd.DataFrame, person_label: str) -> list[str]:
-    parts = person_label.split(" - ")
-    if len(parts) != 2:
-        return []
-    family, name = parts[0].strip(), parts[1].strip()
-    if "تاریخ" not in df.columns:
-        return []
-    mask = (df["نام خانوادگی"] == family) & (df["نام"] == name)
-    dates = df.loc[mask, "تاریخ"].dropna().unique().tolist()
-    return dates
-
-
-def get_person_rows_for_date(
-    df: pd.DataFrame, person_label: str, date: str
-) -> pd.DataFrame:
-    parts = person_label.split(" - ")
-    if len(parts) != 2:
-        return pd.DataFrame()
-    family, name = parts[0].strip(), parts[1].strip()
-    mask = (
-        (df["نام خانوادگی"] == family)
-        & (df["نام"] == name)
-        & (df["تاریخ"] == date)
-    )
-    return df.loc[mask].reset_index(drop=True)
-
-
-def find_similar_records(
-    df: pd.DataFrame,
-    reference_rows: pd.DataFrame,
-    match_columns: list[str] | None = None,
-) -> pd.DataFrame:
-    if match_columns is None:
-        match_columns = ["ورود", "خروج"]
-
-    missing = [c for c in match_columns if c not in df.columns]
-    if missing:
-        raise ValueError(f"ستون‌های {missing} در داده‌ها یافت نشدند.")
-
-    patterns: list[tuple] = []
-    for _, row in reference_rows.iterrows():
-        entry_val = row.get("ورود", np.nan)
-        exit_val = row.get("خروج", np.nan)
-        if pd.isna(entry_val) and pd.isna(exit_val):
-            continue
-        patterns.append((entry_val, exit_val))
-
-    if not patterns:
-        return pd.DataFrame()
-
-    combined_mask = pd.Series(False, index=df.index)
-    for entry_val, exit_val in patterns:
-        row_mask = pd.Series(True, index=df.index)
-        if pd.isna(entry_val):
-            row_mask &= df["ورود"].isna()
-        else:
-            row_mask &= df["ورود"] == entry_val
-        if pd.isna(exit_val):
-            row_mask &= df["خروج"].isna()
-        else:
-            row_mask &= df["خروج"] == exit_val
-        combined_mask |= row_mask
-
-    result = df.loc[combined_mask].reset_index(drop=True)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════
-# بخش ۳: توابع کمکی UI
-# ═══════════════════════════════════════════════════════════════
-
-def _reset_session():
-    keys_to_keep = {"file_upload"}
-    for key in list(st.session_state.keys()):
-        if key not in keys_to_keep:
-            del st.session_state[key]
-
-
-def _get_active_renames() -> dict[str, str]:
-    renames = st.session_state.get("column_renames", {})
-    return {k: v for k, v in renames.items() if k != v and v.strip()}
-
-
-def _apply_renames(df: pd.DataFrame) -> pd.DataFrame:
-    actual = _get_active_renames()
-    if actual:
-        return df.rename(columns=actual)
-    return df.copy()
-
-
-def _export_to_excel(df: pd.DataFrame, filename: str = "result.xlsx") -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="نتیجه")
-        worksheet = writer.sheets["نتیجه"]
-        for i, col in enumerate(df.columns):
-            col_data = df[col].astype(str)
-            max_len = max(col_data.apply(len).max(), len(str(col))) + 3
-            max_len = min(max_len, 55)
-            col_letter = get_column_letter(i + 1)
-            worksheet.column_dimensions[col_letter].width = max_len
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# ═══════════════════════════════════════════════════════════════
-# بخش ۴: اپلیکیشن اصلی
-# ═══════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════
+# Page Config — MUST be first Streamlit command
+# ═══════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="آنالیزور غیبت و تردد",
-    page_icon="📊",
+    page_title="پردازشگر فایل اکسل",
+    page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DARK_THEME_CSS = """
+# ═══════════════════════════════════════════════════════════
+# RTL Styling
+# ═══════════════════════════════════════════════════════════
+st.markdown(
+    """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap');
-    * {
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;700&display=swap');
+
+    html, body, [class*="st-"]  {
         font-family: 'Vazirmatn', 'Tahoma', 'Arial', sans-serif !important;
-        direction: rtl;
-        text-align: right;
     }
-    .stApp { background-color: #0E1117; color: #FAFAFA; }
-    h1, h2, h3, h4, h5, h6 {
-        color: #E8E8E8 !important;
-        font-family: 'Vazirmatn', sans-serif !important;
-        text-align: right !important;
-    }
-    p, span, label, div { text-align: right; }
-    .stButton > button[kind="primary"],
-    .stButton > button:not([kind]) {
-        background: linear-gradient(135deg, #FF4B4B, #E53935);
-        color: white; font-weight: 600; border: none; border-radius: 10px;
-        padding: 12px 28px; font-size: 15px; transition: all 0.3s ease;
-        box-shadow: 0 2px 8px rgba(255, 75, 75, 0.25);
-    }
-    .stButton > button:hover {
-        background: linear-gradient(135deg, #FF6B6B, #FF5252);
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(255, 75, 75, 0.45);
-    }
-    .stButton > button:active { transform: translateY(0); }
-    .stDownloadButton > button {
-        background: linear-gradient(135deg, #00C853, #00E676);
-        color: #0E1117; font-weight: 700; border: none; border-radius: 10px;
-        padding: 12px 28px; font-size: 15px; transition: all 0.3s ease;
-        box-shadow: 0 2px 8px rgba(0, 200, 83, 0.25);
-    }
-    .stDownloadButton > button:hover {
-        background: linear-gradient(135deg, #69F0AE, #B9F6CA);
-        color: #1B5E20; transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(0, 200, 83, 0.45);
-    }
-    div[data-testid="stSidebar"] {
-        background-color: #161822; border-left: 1px solid #2A2D35;
-    }
-    div[data-testid="stSidebar"] * { color: #E0E0E0; }
-    div[data-testid="stMetricValue"] {
-        color: #FFFFFF !important; font-size: 28px !important; font-weight: 700 !important;
-    }
-    div[data-testid="stMetricLabel"] {
-        color: #9E9E9E !important; font-size: 13px !important;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 4px; background-color: #161822; border-radius: 12px; padding: 4px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 10px; padding: 10px 20px; color: #9E9E9E;
-        font-weight: 500; background-color: transparent;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #262730 !important; color: #FFFFFF !important; font-weight: 700;
-    }
-    .stSelectbox label, .stTextInput label { color: #E0E0E0 !important; font-weight: 600; }
-    div[data-baseweb="select"] { background-color: #262730 !important; }
-    div[data-baseweb="input"] { background-color: #262730 !important; }
-    .stDataFrame {
-        border-radius: 10px; overflow: hidden; border: 1px solid #2A2D35;
-    }
-    .dataframe th {
-        background-color: #1E2028 !important; color: #E0E0E0 !important;
-        font-weight: 700 !important; border-bottom: 2px solid #FF4B4B !important;
-        text-align: right !important; padding: 10px 12px !important;
-    }
-    .dataframe td {
-        color: #E8E8E8 !important; text-align: right !important;
-        padding: 8px 12px !important; border-bottom: 1px solid #1E2028 !important;
-    }
-    .dataframe tr:hover { background-color: #262730 !important; }
-    [data-testid="stFileUploader"] section {
-        background-color: #1A1D23; border: 2px dashed #3A3D45;
-        border-radius: 12px; padding: 30px; transition: all 0.3s ease;
-    }
-    [data-testid="stFileUploader"] section:hover {
-        border-color: #FF4B4B; background-color: #1E2028;
-    }
-    hr { border-color: #2A2D35; margin: 20px 0; }
-    .stCaption { color: #757575 !important; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: #1A1D23; }
-    ::-webkit-scrollbar-thumb { background: #3A3D45; border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: #4A4D55; }
+
+    .stApp                        { direction: rtl; }
+    .stMarkdown, .stCaption,
+    .stSubheader, .stHeader,
+    h1, h2, h3, p, span, label,
+    .stSelectbox label,
+    .stMultiselect label,
+    .stNumberInput label,
+    .stTextInput label,
+    .stFileUploader label,
+    .stRadio label                 { direction: rtl; text-align: right; }
+
+    .stDataFrame                   { direction: ltr; text-align: left; }
+    .stButton > button             { font-family: 'Vazirmatn', 'Tahoma', sans-serif; width: 100%; }
+    [data-testid="stSidebar"]      { direction: rtl; text-align: right; }
+
+    /* fix download button direction */
+    .stDownloadButton > button     { direction: rtl; font-family: 'Vazirmatn', 'Tahoma', sans-serif; }
 </style>
-"""
+""",
+    unsafe_allow_html=True,
+)
 
-st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════
+# Utility Functions
+# ═══════════════════════════════════════════════════════════
+
+def flatten_multiindex_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """
+    Remove parent column headers, promote sub-column names to top level.
+
+    Before:  ('a','aa') | ('a','bb') | ('a','cc') | ('b',NaN) | ('c',NaN)
+    After :  'aa'       | 'bb'       | 'cc'       | 'b'       | 'c'
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df, False
+
+    new_columns: list[str] = []
+    for col in df.columns:
+        parts = [
+            str(c).strip()
+            for c in col
+            if pd.notna(c) and str(c).strip()
+        ]
+        if len(parts) > 1:
+            # Has sub-column → use lowest-level name
+            new_columns.append(parts[-1])
+        elif len(parts) == 1:
+            new_columns.append(parts[0])
+        else:
+            new_columns.append(f"col_{len(new_columns)}")
+
+    # Resolve duplicate names
+    seen: dict[str, int] = {}
+    final: list[str] = []
+    for c in new_columns:
+        if c in seen:
+            seen[c] += 1
+            final.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            final.append(c)
+
+    df.columns = final
+    return df, True
 
 
-def main():
+def safe_forward_fill(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Forward-fill selected columns (handles merged-cell NaN patterns)."""
+    df = df.copy()
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].astype(object).ffill()
+    return df
+
+
+def safe_merge_columns(
+    df: pd.DataFrame,
+    columns_to_merge: list[str],
+    new_name: str,
+    separator: str = " ",
+) -> pd.DataFrame:
+    """
+    Merge multiple columns into one.
+    Example:  "علی" + "حسینی"  →  "علی حسینی"
+    NaN / empty values are skipped so no double-spaces appear.
+    """
+    df = df.copy()
+    str_parts: list[pd.Series] = []
+
+    for col in columns_to_merge:
+        if col in df.columns:
+            s = df[col].astype(str)
+            # Normalise all NaN representations to empty string
+            s = s.replace({"nan": "", "NaT": "", "None": "", "none": ""})
+            str_parts.append(s)
+        else:
+            str_parts.append(pd.Series([""] * len(df), index=df.index))
+
+    merged = str_parts[0]
+    for part in str_parts[1:]:
+        merged = merged.str.cat(part, sep=separator, na_rep="")
+
+    # Trim leading/trailing separators, turn empty → NaN
+    merged = merged.str.strip(separator)
+    merged = merged.replace("", np.nan)
+
+    # Drop originals, insert new column
+    cols_to_drop = [c for c in columns_to_merge if c in df.columns]
+    df = df.drop(columns=cols_to_drop)
+    df.insert(0, new_name, merged)          # put merged col at the front
+    return df
+
+
+def filter_incomplete_rows(
+    df: pd.DataFrame, entry_col: str, exit_col: str
+) -> pd.DataFrame:
+    """
+    Keep only rows where *either* entry or exit is missing / empty.
+    """
+    if entry_col not in df.columns or exit_col not in df.columns:
+        raise ValueError("یکی یا هر دو ستون انتخابی در داده‌ها وجود ندارند.")
+
+    def _is_empty(series: pd.Series) -> pd.Series:
+        s_str = series.astype(str).str.strip()
+        return series.isna() | s_str.isin(["", "nan", "None", "NaT", "none"])
+
+    mask = _is_empty(df[entry_col]) | _is_empty(df[exit_col])
+    return df[mask].reset_index(drop=True)
+
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Export DataFrame to in-memory .xlsx bytes."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Sheet1", na_rep="")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def read_excel_safely(file_obj, header_rows: int) -> pd.DataFrame:
+    """Try openpyxl first (xlsx), fall back to xlrd (xls)."""
+    header_arg = list(range(header_rows)) if header_rows > 1 else 0
+    try:
+        return pd.read_excel(file_obj, header=header_arg, engine="openpyxl")
+    except Exception:
+        file_obj.seek(0)
+        return pd.read_excel(file_obj, header=header_arg, engine="xlrd")
+
+
+# ═══════════════════════════════════════════════════════════
+# Session State
+# ═══════════════════════════════════════════════════════════
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "original_df" not in st.session_state:
+    st.session_state.original_df = None
+if "history" not in st.session_state:
+    st.session_state.history: list[pd.DataFrame] = []
+if "step_log" not in st.session_state:
+    st.session_state.step_log: list[str] = []
+
+
+def _push_history(label: str):
+    """Record current df in history & log the step."""
+    st.session_state.history.append(st.session_state.df.copy())
+    st.session_state.step_log.append(label)
+
+
+# ═══════════════════════════════════════════════════════════
+# Sidebar — All Controls
+# ═══════════════════════════════════════════════════════════
+with st.sidebar:
+    st.header("⚙️ پنل عملیات")
+
+    # ── Upload ──────────────────────────────────────────
+    st.subheader("📤 آپلود فایل")
+    uploaded = st.file_uploader(
+        "فایل اکسل را انتخاب کنید",
+        type=["xlsx", "xls"],
+        key="uploader",
+    )
+    header_rows = st.number_input(
+        "تعداد سطرهای سرستون",
+        min_value=1, max_value=5, value=1,
+        help="اگر فایل سرستون چندسطحی دارد (ستون اصلی + زیرستون)، تعداد سطرهای سرستون را وارد کنید.",
+        key="n_header",
+    )
+    if uploaded and st.button("📂 خواندن فایل", use_container_width=True, key="btn_read"):
+        try:
+            with st.spinner("در حال خواندن…"):
+                df = read_excel_safely(uploaded, header_rows)
+                st.session_state.original_df = df.copy()
+                st.session_state.df = df.copy()
+                st.session_state.history = [df.copy()]
+                st.session_state.step_log = ["خواندن فایل اصلی"]
+            st.success("✅ فایل با موفقیت خوانده شد!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ خطا در خواندن فایل:\n`{e}`")
+
+    # ── Step 1: Flatten ─────────────────────────────────
+    st.divider()
+    st.subheader("۱️⃣ یکسان‌سازی سرستون‌ها")
+    if st.session_state.df is not None:
+        if isinstance(st.session_state.df.columns, pd.MultiIndex):
+            st.info("🔒 سرستون‌های چندسطحی شناسایی شد!")
+            if st.button("یکسان‌سازی", use_container_width=True, key="btn_flat"):
+                st.session_state.df, _ = flatten_multiindex_columns(st.session_state.df)
+                _push_history("یکسان‌سازی سرستون‌ها")
+                st.success("✅ انجام شد!")
+                st.rerun()
+        else:
+            st.success("✅ سرستون‌ها یکسان هستند.")
+    else:
+        st.caption("ابتدا فایل را آپلود کنید.")
+
+    # ── Step 2: Forward-Fill ────────────────────────────
+    st.divider()
+    st.subheader("۲️⃣ پر کردن سلول‌های ادغام‌شده")
+    if st.session_state.df is not None:
+        st.caption(
+            "ستون‌هایی که در اکسل ادغام (Merge) شده‌اند را انتخاب کنید. "
+            "مقدار سلول بالایی در ردیف‌های خالی تکرار می‌شود."
+        )
+        ff_cols = st.multiselect(
+            "انتخاب ستون‌ها",
+            st.session_state.df.columns.tolist(),
+            key="ff_cols",
+        )
+        if st.button("پر کردن مقادیر خالی", use_container_width=True, key="btn_ff"):
+            if ff_cols:
+                st.session_state.df = safe_forward_fill(st.session_state.df, ff_cols)
+                _push_history(f"پر کردن: {', '.join(ff_cols)}")
+                st.success("✅ انجام شد!")
+                st.rerun()
+            else:
+                st.warning("حداقل یک ستون انتخاب کنید.")
+    else:
+        st.caption("ابتدا فایل را آپلود کنید.")
+
+    # ── Step 3: Merge Columns ───────────────────────────
+    st.divider()
+    st.subheader("۳️⃣ ادغام ستون‌ها")
+    if st.session_state.df is not None:
+        st.caption(
+            "مثلاً ستون «نام» و «نام‌خانوادگی» را انتخاب کنید تا «علی حسینی» ساخته شود."
+        )
+        mg_cols = st.multiselect(
+            "ستون‌ها برای ادغام (حداقل ۲)",
+            st.session_state.df.columns.tolist(),
+            key="mg_cols",
+        )
+        mg_name = st.text_input(
+            "نام ستون جدید", placeholder="نام_کامل", key="mg_name"
+        )
+        if st.button("ادغام", use_container_width=True, key="btn_mg"):
+            if len(mg_cols) < 2:
+                st.warning("حداقل دو ستون انتخاب کنید.")
+            elif not mg_name.strip():
+                st.warning("نام ستون جدید را وارد کنید.")
+            else:
+                try:
+                    st.session_state.df = safe_merge_columns(
+                        st.session_state.df, mg_cols, mg_name.strip()
+                    )
+                    _push_history(f"ادغام → {mg_name.strip()}")
+                    st.success("✅ انجام شد!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ خطا: {e}")
+    else:
+        st.caption("ابتدا فایل را آپلود کنید.")
+
+    # ── Step 4: Filter Incomplete ───────────────────────
+    st.divider()
+    st.subheader("۴️⃣ فیلتر ردیف‌های ناقص")
+    if st.session_state.df is not None:
+        st.caption(
+            "ردیف‌هایی که **ورود** یا **خروج** آن‌ها خالی / ناقص است فیلتر شده و فقط همان‌ها در خروجی باقی می‌مانند."
+        )
+        opts = st.session_state.df.columns.tolist()
+
+        # Auto-detect entry / exit column names
+        entry_idx, exit_idx = 0, 0
+        for i, c in enumerate(opts):
+            if "ورود" in str(c):
+                entry_idx = i + 1
+            if "خروج" in str(c):
+                exit_idx = i + 1
+
+        entry_col = st.selectbox("ستون «ورود»", [""] + opts, index=entry_idx, key="sel_in")
+        exit_col = st.selectbox("ستون «خروج»", [""] + opts, index=exit_idx, key="sel_out")
+
+        if st.button("فیلتر ردیف‌های ناقص", use_container_width=True, key="btn_filt"):
+            if not entry_col or not exit_col:
+                st.warning("هر دو ستون را انتخاب کنید.")
+            else:
+                try:
+                    filtered = filter_incomplete_rows(st.session_state.df, entry_col, exit_col)
+                    st.session_state.df = filtered
+                    _push_history(f"فیلتر ناقص ({len(filtered)} ردیف)")
+                    st.success(f"✅ {len(filtered)} ردیف ناقص باقی ماند.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ خطا: {e}")
+    else:
+        st.caption("ابتدا فایل را آپلود کنید.")
+
+    # ── Undo / Reset ────────────────────────────────────
+    st.divider()
+    st.subheader("🔧 ابزارها")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("↩️ بازگشت", use_container_width=True, key="btn_undo"):
+            if len(st.session_state.history) > 1:
+                st.session_state.history.pop()
+                st.session_state.step_log.pop()
+                st.session_state.df = st.session_state.history[-1].copy()
+                st.rerun()
+            else:
+                st.info("مرحله‌ای نیست.")
+    with c2:
+        if st.button("🔄 شروع مجدد", use_container_width=True, key="btn_reset"):
+            if st.session_state.original_df is not None:
+                st.session_state.df = st.session_state.original_df.copy()
+                st.session_state.history = [st.session_state.original_df.copy()]
+                st.session_state.step_log = ["بازنشانی به فایل اصلی"]
+                st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════
+# Main Area — Preview & Download
+# ═══════════════════════════════════════════════════════════
+st.title("📋 پردازشگر فایل اکسل")
+st.caption(
+    "یکسان‌سازی سرستون‌ها  ·  پر کردن سلول‌های ادغام‌شده  "
+    "·  ادغام ستون‌ها  ·  فیلتر ردیف‌های ناقص ورود/خروج"
+)
+
+if st.session_state.df is not None:
+    df = st.session_state.df
+
+    # ── Metrics ─────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("تعداد سطرها", f"{len(df):,}")
+    m2.metric("تعداد ستون‌ها", len(df.columns))
+    m3.metric("مقادیر خالی", f"{int(df.isna().sum().sum()):,}")
+    m4.metric("مراحل انجام‌شده", len(st.session_state.step_log) - 1)
+
+    # ── Step log ────────────────────────────────────────
+    if len(st.session_state.step_log) > 1:
+        with st.expander("📜 تاریخچه عملیات"):
+            for i, step in enumerate(st.session_state.step_log):
+                st.markdown(f"**{i}**. {step}")
+
+    # ── Tabs: Current vs Original ───────────────────────
+    tab_cur, tab_orig = st.tabs(["📊 داده‌های فعلی", "📄 فایل اصلی"])
+
+    with tab_cur:
+        st.dataframe(df, use_container_width=True, height=480)
+
+    with tab_orig:
+        if st.session_state.original_df is not None:
+            st.dataframe(st.session_state.original_df, use_container_width=True, height=480)
+
+    # ── Download ────────────────────────────────────────
+    st.divider()
+    st.subheader("📥 دانلود فایل نهایی")
+
+    if len(df) == 0:
+        st.warning(
+            "⚠️ داده‌ای برای دانلود وجود ندارد — ممکن است همه ردیف‌ها فیلتر شده باشند. "
+            "از دکمه «بازگشت» استفاده کنید."
+        )
+    else:
+        xlsx_bytes = df_to_excel_bytes(df)
+        csv_bytes = df.to_csv(index=False, na_rep="").encode("utf-8-sig")
+
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                label="📥 دانلود Excel (.xlsx)",
+                data=xlsx_bytes,
+                file_name="processed_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with d2:
+            st.download_button(
+                label="📥 دانلود CSV (.csv)",
+                data=csv_bytes,
+                file_name="processed_data.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+else:
+    # ── Empty State ─────────────────────────────────────
     st.markdown(
         """
-        <div style="text-align: center; margin-bottom: 10px;">
-            <h1 style="margin-bottom: 4px;">📊 آنالیزور غیبت و تردد</h1>
-            <p style="color: #757575; font-size: 14px; margin-top: 0;">
-                تمیزکاری، استانداردسازی و تحلیل فایل‌های اکسل حضور و غیاب پرسنل
+        <div style="
+            text-align: center;
+            padding: 100px 20px;
+            border: 2px dashed #d0d0d0;
+            border-radius: 16px;
+            margin-top: 60px;
+            background: #fafafa;
+        ">
+            <p style="font-size: 4rem; margin-bottom: 0;">📂</p>
+            <h2 style="color: #888; margin-top: 10px;">
+                فایل اکسل خود را از پنل سمت چپ آپلود کنید
+            </h2>
+            <p style="color: #aaa; margin-top: 8px;">
+                فرمت‌های پشتیبانی‌شده: <b>.xlsx</b> و <b>.xls</b>
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown("<hr style='border-color: #2A2D35;'>", unsafe_allow_html=True)
-
-    # ── آپلود فایل ──
-    st.subheader("📁 آپلود فایل اکسل")
-    uploaded_file = st.file_uploader(
-        "فایل اکسل (.xlsx یا .xls) خود را انتخاب کنید",
-        type=["xlsx", "xls"],
-        key="file_upload",
-        label_visibility="collapsed",
-    )
-
-    if uploaded_file is None:
-        st.markdown(
-            """
-            <div style="
-                background: linear-gradient(135deg, #0D47A1, #1565C0);
-                color: white; padding: 16px 24px; border-radius: 10px; margin: 16px 0;
-            ">
-                <strong>📌 راهنمای استفاده:</strong><br><br>
-                ۱. فایل اکسل غیبت را آپلود کنید<br>
-                ۲. در تب «پیش‌نمایش» داده‌های تمیز شده را ببینید<br>
-                ۳. در تب «تغییر نام» نام ستون‌ها را اصلاح کنید<br>
-                ۴. در تب «آنالیز» فرد و تاریخ را انتخاب و جستجو کنید
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    # ── پردازش فایل ──
-    if (
-        "df_clean" not in st.session_state
-        or st.session_state.get("_last_file") != uploaded_file.name
-    ):
-        _reset_session()
-        with st.spinner("در حال خواندن و تمیزکاری فایل..."):
-            try:
-                df_clean = parse_and_clean_excel(uploaded_file)
-                st.session_state["df_clean"] = df_clean
-                st.session_state["_last_file"] = uploaded_file.name
-                st.session_state["column_renames"] = {
-                    col: col for col in df_clean.columns
-                }
-            except ValueError as e:
-                st.error(f"❌ خطا در پردازش فایل:\n\n{str(e)}")
-                return
-            except Exception as e:
-                st.error(f"❌ خطای غیرمنتظره:\n\n{str(e)}")
-                return
-
-    df_clean = st.session_state["df_clean"]
-
-    st.markdown(
-        f"""
-        <div style="
-            background: linear-gradient(135deg, #1B5E20, #2E7D32);
-            color: white; padding: 14px 24px; border-radius: 10px; margin: 8px 0 16px 0;
-        ">
-            ✅ فایل <strong>{uploaded_file.name}</strong> با موفقیت پردازش شد —
-            <strong>{len(df_clean):,}</strong> ردیف و
-            <strong>{len(df_clean.columns)}</strong> ستون استخراج شد
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    with mc1:
-        st.metric("تعداد ردیف‌ها", f"{len(df_clean):,}")
-    with mc2:
-        unique_persons = df_clean[["نام", "نام خانوادگی"]].drop_duplicates()
-        st.metric("تعداد افراد", f"{len(unique_persons):,}")
-    with mc3:
-        if "تاریخ" in df_clean.columns:
-            st.metric("تعداد تاریخ‌ها", f"{df_clean['تاریخ'].dropna().nunique():,}")
-    with mc4:
-        if "وضعیت" in df_clean.columns:
-            present_count = df_clean["وضعیت"].dropna().str.contains("حضور").sum()
-            st.metric("ردیف‌های با حضور", f"{present_count:,}")
-
-    st.markdown("<hr style='border-color: #2A2D35;'>", unsafe_allow_html=True)
-
-    # ── تب‌ها ──
-    tab_preview, tab_rename, tab_analyze = st.tabs(
-        ["📋 پیش‌نمایش داده‌ها", "✏️ تغییر نام ستون‌ها", "🔍 آنالیز و جستجو"]
-    )
-
-    # ────── تب ۱: پیش‌نمایش ──────
-    with tab_preview:
-        st.subheader("داده‌های تمیز و استاندارد شده")
-        display_df = _apply_renames(df_clean)
-        st.dataframe(display_df, use_container_width=True, height=480, hide_index=True)
-        st.download_button(
-            label="📥 دانلود اکسل تمیز شده",
-            data=_export_to_excel(display_df, "cleaned_data.xlsx"),
-            file_name="cleaned_data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    # ────── تب ۲: تغییر نام ──────
-    with tab_rename:
-        st.subheader("تغییر نام ستون‌ها")
-        st.caption("نام دلخواه خود را وارد کنید. فیلدهای خالی نام اصلی را حفظ می‌کنند.")
-        current_renames = st.session_state.get("column_renames", {c: c for c in df_clean.columns})
-        new_renames: dict[str, str] = {}
-        columns_list = list(df_clean.columns)
-        cols_per_row = 3
-        for i in range(0, len(columns_list), cols_per_row):
-            row_cols = st.columns(cols_per_row)
-            for j, col in enumerate(columns_list[i : i + cols_per_row]):
-                with row_cols[j]:
-                    st.markdown(
-                        f"<span style='color:#9E9E9E; font-size:12px;'>"
-                        f"نام اصلی: <strong>{col}</strong></span>",
-                        unsafe_allow_html=True,
-                    )
-                    new_name = st.text_input(
-                        label=f"نام جدید برای {col}",
-                        value=current_renames.get(col, col),
-                        key=f"rename_{col}",
-                        label_visibility="collapsed",
-                        placeholder=col,
-                    )
-                    new_renames[col] = new_name
-        bc1, bc2 = st.columns([1, 4])
-        with bc1:
-            if st.button("💾 اعمال تغییرات", type="primary"):
-                st.session_state["column_renames"] = new_renames
-                st.success("✅ تغییرات ذخیره شد.")
-                st.rerun()
-
-    # ────── تب ۳: آنالیز ──────
-    with tab_analyze:
-        st.subheader("آنالیز و جستجوی موارد مشابه")
-        st.markdown(
-            """
-            <div style="
-                background: linear-gradient(135deg, #0D47A1, #1565C0);
-                color: white; padding: 16px 24px; border-radius: 10px; margin-bottom: 20px;
-            ">
-                <strong>🔎 روش کار:</strong><br><br>
-                ۱. یک نفر را از لیست انتخاب کنید<br>
-                ۲. تاریخ مورد نظر را انتخاب کنید<br>
-                ۳. رکوردهای تردد آن شخص در آن تاریخ نمایش داده می‌شود<br>
-                ۴. با کلیک بر دکمه «جستجوی موارد مشابه»، تمام ردیف‌هایی در کل
-                فایل که <strong>ورود و خروج یکسانی</strong> دارند پیدا می‌شوند<br>
-                ۵. نتایج قابل دانلود هستند
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        persons = get_unique_persons(df_clean)
-        if not persons:
-            st.warning("⚠️ هیچ فردی در داده‌ها یافت نشد.")
-            return
-
-        cs1, cs2 = st.columns(2)
-        with cs1:
-            selected_person = st.selectbox(
-                "👤 انتخاب فرد:", options=persons, key="person_select",
-                index=None, placeholder="-- فرد مورد نظر را انتخاب کنید --",
-            )
-
-        selected_date = None
-        if selected_person:
-            dates = get_person_dates(df_clean, selected_person)
-            if dates:
-                with cs2:
-                    selected_date = st.selectbox(
-                        "📅 انتخاب تاریخ:", options=dates, key="date_select",
-                        index=None, placeholder="-- تاریخ را انتخاب کنید --",
-                    )
-            else:
-                st.warning("⚠️ هیچ تاریخی برای این فرد یافت نشد.")
-
-        if selected_person and selected_date:
-            person_rows = get_person_rows_for_date(df_clean, selected_person, selected_date)
-            if person_rows.empty:
-                st.warning("⚠️ رکوردی برای این فرد در تاریخ انتخاب شده یافت نشد.")
-            else:
-                display_rows = _apply_renames(person_rows)
-                st.markdown("#### رکوردهای تردد فرد در تاریخ انتخاب شده")
-                st.dataframe(
-                    display_rows, use_container_width=True,
-                    height=min(200, 50 + len(display_rows) * 35), hide_index=True,
-                )
-
-                if "ورود" in person_rows.columns and "خروج" in person_rows.columns:
-                    patterns = person_rows[["ورود", "خروج"]].dropna(how="all")
-                    if not patterns.empty:
-                        st.markdown("#### الگوهای ورود / خروج")
-                        html_parts = []
-                        for _, row in patterns.iterrows():
-                            ev = row["ورود"] if pd.notna(row["ورود"]) else "—"
-                            xv = row["خروج"] if pd.notna(row["خروج"]) else "—"
-                            html_parts.append(
-                                f"<span style='display:inline-block; background:#262730; "
-                                f"padding:8px 18px; border-radius:8px; margin:4px 4px 4px 0; "
-                                f"border-right: 3px solid #FF4B4B;'>"
-                                f"⏰ ورود: <strong>{ev}</strong>&nbsp;&nbsp;|&nbsp;&nbsp;"
-                                f"⏰ خروج: <strong>{xv}</strong></span>"
-                            )
-                        st.markdown("".join(html_parts), unsafe_allow_html=True)
-
-                st.markdown("---")
-                st.markdown("<div style='text-align: center;'>", unsafe_allow_html=True)
-                search_clicked = st.button(
-                    "🔍 جستجوی موارد مشابه در کل فایل",
-                    type="primary", use_container_width=True,
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-
-                if search_clicked:
-                    with st.spinner("در حال جستجوی ردیف‌های مشابه..."):
-                        try:
-                            results = find_similar_records(df_clean, person_rows)
-                            st.session_state["analysis_results"] = results
-                        except ValueError as e:
-                            st.error(f"❌ {str(e)}")
-                            return
-
-                    if results.empty:
-                        st.warning("⚠️ هیچ ردیف مشابهی در کل فایل یافت نشد.")
-                    else:
-                        st.session_state["analysis_results"] = results
-
-        # ── نمایش نتایج ──
-        if "analysis_results" in st.session_state:
-            results = st.session_state["analysis_results"]
-            if not results.empty:
-                display_results = _apply_renames(results)
-                st.markdown("---")
-                st.markdown(
-                    f"#### 📊 نتایج جستجو — "
-                    f"<span style='color:#FF4B4B;'>{len(results):,} ردیف مشابه</span> یافت شد",
-                    unsafe_allow_html=True,
-                )
-                rc1, rc2, rc3 = st.columns(3)
-                with rc1:
-                    st.metric("ردیف‌های مشابه", f"{len(results):,}")
-                with rc2:
-                    if "نام" in results.columns and "نام خانوادگی" in results.columns:
-                        mp = results[["نام", "نام خانوادگی"]].drop_duplicates()
-                        st.metric("افراد مشابه", f"{len(mp):,}")
-                with rc3:
-                    if "تاریخ" in results.columns:
-                        st.metric("تاریخ‌های مختلف", f"{results['تاریخ'].nunique():,}")
-
-                st.dataframe(display_results, use_container_width=True, height=450, hide_index=True)
-                st.download_button(
-                    label="📥 دانلود نتایج جستجو (Excel)",
-                    data=_export_to_excel(display_results, "analysis_results.xlsx"),
-                    file_name="analysis_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                if st.button("🗑️ پاک کردن نتایج جستجو"):
-                    del st.session_state["analysis_results"]
-                    st.rerun()
-
-
-if __name__ == "__main__":
-    main()
