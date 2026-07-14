@@ -1,0 +1,646 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+
+from openpyxl.utils import get_column_letter
+
+from utils.excel_parser import parse_and_clean_excel
+from utils.analyzer import (
+    get_unique_persons,
+    get_person_dates,
+    get_person_rows_for_date,
+    find_similar_records,
+)
+
+# ═══════════════════════════════════════════════════
+# تنظیمات صفحه
+# ═══════════════════════════════════════════════════
+st.set_page_config(
+    page_title="آنالیزور غیبت و تردد",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ═══════════════════════════════════════════════════
+# CSS تم تاریک و RTL
+# ═══════════════════════════════════════════════════
+DARK_THEME_CSS = """
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap');
+
+    * {
+        font-family: 'Vazirmatn', 'Tahoma', 'Arial', sans-serif !important;
+        direction: rtl;
+        text-align: right;
+    }
+
+    .stApp {
+        background-color: #0E1117;
+        color: #FAFAFA;
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+        color: #E8E8E8 !important;
+        font-family: 'Vazirmatn', sans-serif !important;
+        text-align: right !important;
+    }
+
+    p, span, label, div {
+        text-align: right;
+    }
+
+    /* دکمه‌های اصلی */
+    .stButton > button[kind="primary"],
+    .stButton > button:not([kind]) {
+        background: linear-gradient(135deg, #FF4B4B, #E53935);
+        color: white;
+        font-weight: 600;
+        border: none;
+        border-radius: 10px;
+        padding: 12px 28px;
+        font-size: 15px;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 8px rgba(255, 75, 75, 0.25);
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #FF6B6B, #FF5252);
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(255, 75, 75, 0.45);
+    }
+    .stButton > button:active {
+        transform: translateY(0);
+    }
+
+    /* دکمه دانلود */
+    .stDownloadButton > button {
+        background: linear-gradient(135deg, #00C853, #00E676);
+        color: #0E1117;
+        font-weight: 700;
+        border: none;
+        border-radius: 10px;
+        padding: 12px 28px;
+        font-size: 15px;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 8px rgba(0, 200, 83, 0.25);
+    }
+    .stDownloadButton > button:hover {
+        background: linear-gradient(135deg, #69F0AE, #B9F6CA);
+        color: #1B5E20;
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(0, 200, 83, 0.45);
+    }
+
+    /* سایدبار */
+    div[data-testid="stSidebar"] {
+        background-color: #161822;
+        border-left: 1px solid #2A2D35;
+    }
+    div[data-testid="stSidebar"] * {
+        color: #E0E0E0;
+    }
+
+    /* کارت‌های متریک */
+    div[data-testid="stMetricValue"] {
+        color: #FFFFFF !important;
+        font-size: 28px !important;
+        font-weight: 700 !important;
+    }
+    div[data-testid="stMetricLabel"] {
+        color: #9E9E9E !important;
+        font-size: 13px !important;
+    }
+
+    /* تب‌ها */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        background-color: #161822;
+        border-radius: 12px;
+        padding: 4px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 10px;
+        padding: 10px 20px;
+        color: #9E9E9E;
+        font-weight: 500;
+        background-color: transparent;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #262730 !important;
+        color: #FFFFFF !important;
+        font-weight: 700;
+    }
+
+    /* سلکت‌باکس و اینپوت */
+    .stSelectbox label, .stTextInput label {
+        color: #E0E0E0 !important;
+        font-weight: 600;
+    }
+    div[data-baseweb="select"] {
+        background-color: #262730 !important;
+    }
+    div[data-baseweb="input"] {
+        background-color: #262730 !important;
+    }
+
+    /* دیتافریم */
+    .stDataFrame {
+        border-radius: 10px;
+        overflow: hidden;
+        border: 1px solid #2A2D35;
+    }
+    .dataframe th {
+        background-color: #1E2028 !important;
+        color: #E0E0E0 !important;
+        font-weight: 700 !important;
+        border-bottom: 2px solid #FF4B4B !important;
+        text-align: right !important;
+        padding: 10px 12px !important;
+    }
+    .dataframe td {
+        color: #E8E8E8 !important;
+        text-align: right !important;
+        padding: 8px 12px !important;
+        border-bottom: 1px solid #1E2028 !important;
+    }
+    .dataframe tr:hover {
+        background-color: #262730 !important;
+    }
+
+    /* اسپینر */
+    [data-testid="stSpinner"] > div {
+        border-top-color: #FF4B4B !important;
+    }
+
+    /* پیام‌ها */
+    .stAlert {
+        border-radius: 10px !important;
+        padding: 14px 20px !important;
+    }
+
+    /* فایل آپلودر */
+    [data-testid="stFileUploader"] section {
+        background-color: #1A1D23;
+        border: 2px dashed #3A3D45;
+        border-radius: 12px;
+        padding: 30px;
+        transition: all 0.3s ease;
+    }
+    [data-testid="stFileUploader"] section:hover {
+        border-color: #FF4B4B;
+        background-color: #1E2028;
+    }
+
+    /* پارتیشن‌کننده */
+    hr {
+        border-color: #2A2D35;
+        margin: 20px 0;
+    }
+
+    /* کپشن */
+    .stCaption {
+        color: #757575 !important;
+    }
+
+    /* اسکرول‌بار */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+        background: #1A1D23;
+    }
+    ::-webkit-scrollbar-thumb {
+        background: #3A3D45;
+        border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+        background: #4A4D55;
+    }
+</style>
+"""
+
+st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════
+# توابع کمکی
+# ═══════════════════════════════════════════════════
+
+def _reset_session():
+    """پاک کردن session state به جز فایل آپلود شده."""
+    keys_to_keep = {"file_upload"}
+    for key in list(st.session_state.keys()):
+        if key not in keys_to_keep:
+            del st.session_state[key]
+
+
+def _get_active_renames() -> dict[str, str]:
+    """دیکشنری تغییر نام ستون‌ها — فقط مواردی که واقعاً تغییر کرده‌اند."""
+    renames = st.session_state.get("column_renames", {})
+    return {k: v for k, v in renames.items() if k != v and v.strip()}
+
+
+def _apply_renames(df: pd.DataFrame) -> pd.DataFrame:
+    """اعمال تغییر نام ستون‌ها روی یک کپی از DataFrame."""
+    actual = _get_active_renames()
+    if actual:
+        return df.rename(columns=actual)
+    return df.copy()
+
+
+def _export_to_excel(df: pd.DataFrame, filename: str = "result.xlsx") -> bytes:
+    """تبدیل DataFrame به بایت‌های اکسل با تنظیم عرض ستون‌ها."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="نتیجه")
+        worksheet = writer.sheets["نتیجه"]
+
+        for i, col in enumerate(df.columns):
+            # محاسبه حداکثر طول محتوا
+            col_data = df[col].astype(str)
+            max_len = max(col_data.apply(len).max(), len(str(col))) + 3
+            max_len = min(max_len, 55)
+            col_letter = get_column_letter(i + 1)
+            worksheet.column_dimensions[col_letter].width = max_len
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ═══════════════════════════════════════════════════
+# تابع اصلی
+# ═══════════════════════════════════════════════════
+
+def main():
+    # ── هدر ──
+    st.markdown(
+        """
+        <div style="text-align: center; margin-bottom: 10px;">
+            <h1 style="margin-bottom: 4px;">📊 آنالیزور غیبت و تردد</h1>
+            <p style="color: #757575; font-size: 14px; margin-top: 0;">
+                تمیزکاری، استانداردسازی و تحلیل فایل‌های اکسل حضور و غیاب پرسنل
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<hr style='border-color: #2A2D35;'>", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════
+    # بخش آپلود فایل
+    # ══════════════════════════════════════════════
+    st.subheader("📁 آپلود فایل اکسل")
+
+    uploaded_file = st.file_uploader(
+        "فایل اکسل (.xlsx یا .xls) خود را انتخاب کنید",
+        type=["xlsx", "xls"],
+        key="file_upload",
+        label_visibility="collapsed",
+    )
+
+    if uploaded_file is None:
+        st.markdown(
+            """
+            <div style="
+                background: linear-gradient(135deg, #0D47A1, #1565C0);
+                color: white; padding: 16px 24px; border-radius: 10px; margin: 16px 0;
+            ">
+                <strong>📌 راهنمای استفاده:</strong><br><br>
+                ۱. فایل اکسل غیبت را آپلود کنید<br>
+                ۲. در تب «پیش‌نمایش» داده‌های تمیز شده را ببینید<br>
+                ۳. در تب «تغییر نام» نام ستون‌ها را اصلاح کنید<br>
+                ۴. در تب «آنالیز» فرد و تاریخ را انتخاب و جستجو کنید
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ══════════════════════════════════════════════
+    # پردازش فایل
+    # ══════════════════════════════════════════════
+    if (
+        "df_clean" not in st.session_state
+        or st.session_state.get("_last_file") != uploaded_file.name
+    ):
+        _reset_session()
+        with st.spinner("در حال خواندن و تمیزکاری فایل..."):
+            try:
+                df_clean = parse_and_clean_excel(uploaded_file)
+                st.session_state["df_clean"] = df_clean
+                st.session_state["_last_file"] = uploaded_file.name
+                st.session_state["column_renames"] = {
+                    col: col for col in df_clean.columns
+                }
+            except ValueError as e:
+                st.error(f"❌ خطا در پردازش فایل:\n\n{str(e)}")
+                return
+            except Exception as e:
+                st.error(f"❌ خطای غیرمنتظره:\n\n{str(e)}")
+                return
+
+    df_clean = st.session_state["df_clean"]
+
+    # ── پیام موفقیت ──
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(135deg, #1B5E20, #2E7D32);
+            color: white; padding: 14px 24px; border-radius: 10px; margin: 8px 0 16px 0;
+        ">
+            ✅ فایل <strong>{uploaded_file.name}</strong> با موفقیت پردازش شد —
+            <strong>{len(df_clean):,}</strong> ردیف و
+            <strong>{len(df_clean.columns)}</strong> ستون استخراج شد
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── متریک‌ها ──
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    with metric_col1:
+        st.metric("تعداد ردیف‌ها", f"{len(df_clean):,}")
+    with metric_col2:
+        unique_persons = df_clean[["نام", "نام خانوادگی"]].drop_duplicates()
+        st.metric("تعداد افراد", f"{len(unique_persons):,}")
+    with metric_col3:
+        if "تاریخ" in df_clean.columns:
+            unique_dates = df_clean["تاریخ"].dropna().nunique()
+            st.metric("تعداد تاریخ‌ها", f"{unique_dates:,}")
+    with metric_col4:
+        if "وضعیت" in df_clean.columns:
+            present_count = (
+                df_clean["وضعیت"].dropna().str.contains("حضور").sum()
+            )
+            st.metric("ردیف‌های با حضور", f"{present_count:,}")
+
+    st.markdown("<hr style='border-color: #2A2D35;'>", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════
+    # تب‌ها
+    # ══════════════════════════════════════════════
+    tab_preview, tab_rename, tab_analyze = st.tabs(
+        ["📋 پیش‌نمایش داده‌ها", "✏️ تغییر نام ستون‌ها", "🔍 آنالیز و جستجو"]
+    )
+
+    # ──────────────────────────────────────────────
+    # تب ۱: پیش‌نمایش
+    # ──────────────────────────────────────────────
+    with tab_preview:
+        st.subheader("داده‌های تمیز و استاندارد شده")
+
+        display_df = _apply_renames(df_clean)
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            height=480,
+            hide_index=True,
+        )
+
+        col_dl1, col_dl2 = st.columns([1, 3])
+        with col_dl1:
+            st.download_button(
+                label="📥 دانلود اکسل تمیز شده",
+                data=_export_to_excel(display_df, "cleaned_data.xlsx"),
+                file_name="cleaned_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    # ──────────────────────────────────────────────
+    # تب ۲: تغییر نام ستون‌ها
+    # ──────────────────────────────────────────────
+    with tab_rename:
+        st.subheader("تغییر نام ستون‌ها")
+        st.caption(
+            "نام دلخواه خود را وارد کنید. فیلدهای خالی یا بدون تغییر، نام اصلی را حفظ می‌کنند."
+        )
+
+        current_renames = st.session_state.get(
+            "column_renames", {col: col for col in df_clean.columns}
+        )
+
+        new_renames: dict[str, str] = {}
+        columns_list = list(df_clean.columns)
+        cols_per_row = 3
+
+        for i in range(0, len(columns_list), cols_per_row):
+            row_cols = st.columns(cols_per_row)
+            for j, col in enumerate(columns_list[i : i + cols_per_row]):
+                with row_cols[j]:
+                    st.markdown(
+                        f"<span style='color:#9E9E9E; font-size:12px;'>"
+                        f"نام اصلی: <strong>{col}</strong></span>",
+                        unsafe_allow_html=True,
+                    )
+                    new_name = st.text_input(
+                        label=f"نام جدید برای {col}",
+                        value=current_renames.get(col, col),
+                        key=f"rename_{col}",
+                        label_visibility="collapsed",
+                        placeholder=col,
+                    )
+                    new_renames[col] = new_name
+
+        btn_col1, btn_col2 = st.columns([1, 4])
+        with btn_col1:
+            if st.button("💾 اعمال تغییرات", type="primary"):
+                st.session_state["column_renames"] = new_renames
+                st.success("✅ تغییرات نام ستون‌ها ذخیره شد.")
+                st.rerun()
+
+    # ──────────────────────────────────────────────
+    # تب ۳: آنالیز
+    # ──────────────────────────────────────────────
+    with tab_analyze:
+        st.subheader("آنالیز و جستجوی موارد مشابه")
+
+        st.markdown(
+            """
+            <div style="
+                background: linear-gradient(135deg, #0D47A1, #1565C0);
+                color: white; padding: 16px 24px; border-radius: 10px; margin-bottom: 20px;
+            ">
+                <strong>🔎 روش کار:</strong><br><br>
+                ۱. یک نفر را از لیست انتخاب کنید<br>
+                ۲. تاریخ مورد نظر را انتخاب کنید<br>
+                ۳. رکوردهای تردد آن شخص در آن تاریخ نمایش داده می‌شود<br>
+                ۴. با کلیک بر دکمه «جستجوی موارد مشابه»، تمام ردیف‌هایی در کل
+                فایل که <strong>ورود و خروج یکسانی</strong> دارند پیدا می‌شوند<br>
+                ۵. نتایج قابل دانلود هستند
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # گرفتن لیست افراد
+        persons = get_unique_persons(df_clean)
+        if not persons:
+            st.warning("⚠️ هیچ فردی در داده‌ها یافت نشد.")
+            return
+
+        # انتخاب فرد
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            selected_person = st.selectbox(
+                "👤 انتخاب فرد:",
+                options=persons,
+                key="person_select",
+                index=None,
+                placeholder="-- فرد مورد نظر را انتخاب کنید --",
+            )
+
+        # انتخاب تاریخ
+        selected_date = None
+        if selected_person:
+            dates = get_person_dates(df_clean, selected_person)
+            if dates:
+                with col_s2:
+                    selected_date = st.selectbox(
+                        "📅 انتخاب تاریخ:",
+                        options=dates,
+                        key="date_select",
+                        index=None,
+                        placeholder="-- تاریخ را انتخاب کنید --",
+                    )
+            else:
+                st.warning("⚠️ هیچ تاریخی برای این فرد یافت نشد.")
+
+        # نمایش رکوردهای فرد در تاریخ انتخاب شده
+        if selected_person and selected_date:
+            person_rows = get_person_rows_for_date(
+                df_clean, selected_person, selected_date
+            )
+
+            if person_rows.empty:
+                st.warning(
+                    "⚠️ رکوردی برای این فرد در تاریخ انتخاب شده یافت نشد."
+                )
+            else:
+                display_rows = _apply_renames(person_rows)
+
+                st.markdown("#### رکوردهای تردد فرد در تاریخ انتخاب شده")
+                st.dataframe(
+                    display_rows,
+                    use_container_width=True,
+                    height=min(200, 50 + len(display_rows) * 35),
+                    hide_index=True,
+                )
+
+                # نمایش الگوهای ورود/خروج
+                if "ورود" in person_rows.columns and "خروج" in person_rows.columns:
+                    patterns = person_rows[["ورود", "خروج"]].dropna(how="all")
+                    if not patterns.empty:
+                        st.markdown("#### الگوهای ورود / خروج")
+                        pattern_html_parts = []
+                        for _, row in patterns.iterrows():
+                            entry_v = (
+                                row["ورود"] if pd.notna(row["ورود"]) else "—"
+                            )
+                            exit_v = (
+                                row["خروج"] if pd.notna(row["خروج"]) else "—"
+                            )
+                            pattern_html_parts.append(
+                                f"<span style='display:inline-block; "
+                                f"background:#262730; padding:8px 18px; "
+                                f"border-radius:8px; margin:4px 4px 4px 0; "
+                                f"border-right: 3px solid #FF4B4B;'>"
+                                f"⏰ ورود: <strong>{entry_v}</strong>"
+                                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                                f"⏰ خروج: <strong>{exit_v}</strong></span>"
+                            )
+                        st.markdown(
+                            "".join(pattern_html_parts), unsafe_allow_html=True
+                        )
+
+                # دکمه جستجو
+                st.markdown("---")
+                st.markdown(
+                    "<div style='text-align: center;'>", unsafe_allow_html=True
+                )
+                search_clicked = st.button(
+                    "🔍 جستجوی موارد مشابه در کل فایل",
+                    type="primary",
+                    use_container_width=True,
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                if search_clicked:
+                    with st.spinner(
+                        "در حال جستجوی ردیف‌های مشابه در کل داده‌ها..."
+                    ):
+                        try:
+                            results = find_similar_records(
+                                df_clean, person_rows
+                            )
+                            st.session_state["analysis_results"] = results
+                        except ValueError as e:
+                            st.error(f"❌ {str(e)}")
+                            return
+
+                    if results.empty:
+                        st.warning(
+                            "⚠️ هیچ ردیف مشابهی در کل فایل یافت نشد."
+                        )
+                    else:
+                        st.session_state["analysis_results"] = results
+
+        # ── نمایش نتایج آنالیز ──
+        if "analysis_results" in st.session_state:
+            results = st.session_state["analysis_results"]
+            if not results.empty:
+                display_results = _apply_renames(results)
+
+                st.markdown("---")
+                st.markdown(
+                    f"#### 📊 نتایج جستجو — "
+                    f"<span style='color:#FF4B4B;'>"
+                    f"{len(results):,} ردیف مشابه</span> یافت شد",
+                    unsafe_allow_html=True,
+                )
+
+                # متریک‌های نتایج
+                rc1, rc2, rc3 = st.columns(3)
+                with rc1:
+                    st.metric("ردیف‌های مشابه", f"{len(results):,}")
+                with rc2:
+                    if "نام" in results.columns and "نام خانوادگی" in results.columns:
+                        matched_persons = results[
+                            ["نام", "نام خانوادگی"]
+                        ].drop_duplicates()
+                        st.metric("افراد مشابه", f"{len(matched_persons):,}")
+                with rc3:
+                    if "تاریخ" in results.columns:
+                        matched_dates = results["تاریخ"].nunique()
+                        st.metric("تاریخ‌های مختلف", f"{matched_dates:,}")
+
+                # جدول نتایج
+                st.dataframe(
+                    display_results,
+                    use_container_width=True,
+                    height=450,
+                    hide_index=True,
+                )
+
+                # دکمه دانلود نتایج
+                st.download_button(
+                    label="📥 دانلود نتایج جستجو (Excel)",
+                    data=_export_to_excel(
+                        display_results, "analysis_results.xlsx"
+                    ),
+                    file_name="analysis_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+                # دکمه پاک کردن نتایج
+                if st.button("🗑️ پاک کردن نتایج جستجو"):
+                    if "analysis_results" in st.session_state:
+                        del st.session_state["analysis_results"]
+                    st.rerun()
+
+
+if __name__ == "__main__":
+    main()
